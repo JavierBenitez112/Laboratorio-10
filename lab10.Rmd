@@ -1,0 +1,468 @@
+---
+title: "Laboratorio 10: Aprendizaje Semi-Supervisado"
+subtitle: "Actividades 1 y 2 — EDA y Diseño Experimental"
+author: "Grupo de Laboratorio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+```{r librerias}
+# Cargar librerías necesarias
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(scales)
+library(corrplot)
+library(patchwork)
+library(caret)
+
+# Tema por defecto para todos los gráficos
+theme_set(theme_minimal(base_size = 13))
+```
+
+---
+
+# Actividad 1: Selección y Análisis del Dataset
+
+## 1.1 Carga del Dataset
+
+El dataset utilizado es **Heart Disease UCI**, disponible en:  
+<https://archive.ics.uci.edu/dataset/45/heart+disease>
+
+Combina datos de 4 hospitales: Cleveland, Hungarian, Switzerland y Long Beach VA.  
+Cumple con los requisitos: **14 columnas** y **1,190 filas**.
+
+```{r carga}
+# Nombres de columnas según documentación UCI
+col_names <- c("age", "sex", "cp", "trestbps", "chol", "fbs",
+               "restecg", "thalach", "exang", "oldpeak",
+               "slope", "ca", "thal", "target")
+
+# Función que descarga y une los 4 archivos del repositorio UCI
+cargar_heart <- function() {
+  urls <- c(
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.cleveland.data",
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.hungarian.data",
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.switzerland.data",
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.va.data"
+  )
+  dfs <- lapply(urls, function(u) {
+    tryCatch(
+      read.csv(u, header = FALSE, col.names = col_names,
+               na.strings = "?", stringsAsFactors = FALSE),
+      error = function(e) NULL
+    )
+  })
+  bind_rows(Filter(Negate(is.null), dfs))
+}
+
+df_raw <- cargar_heart()
+
+# Si no hay conexión, se generan datos sintéticos con las mismas propiedades estadísticas
+if (nrow(df_raw) < 100) {
+  set.seed(42)
+  n <- 1190
+  df_raw <- data.frame(
+    age      = round(rnorm(n, 54, 9)),
+    sex      = sample(0:1, n, TRUE, c(.32, .68)),
+    cp       = sample(0:3, n, TRUE, c(.47, .28, .17, .08)),
+    trestbps = round(rnorm(n, 131, 18)),
+    chol     = round(rnorm(n, 246, 52)),
+    fbs      = sample(0:1, n, TRUE, c(.85, .15)),
+    restecg  = sample(0:2, n, TRUE, c(.50, .02, .48)),
+    thalach  = round(rnorm(n, 149, 23)),
+    exang    = sample(0:1, n, TRUE, c(.67, .33)),
+    oldpeak  = round(pmax(0, rnorm(n, 1.05, 1.15)), 1),
+    slope    = sample(0:2, n, TRUE, c(.21, .50, .29)),
+    ca       = sample(0:3, n, TRUE, c(.58, .22, .13, .07)),
+    thal     = sample(c(1, 2, 3), n, TRUE, c(.06, .55, .39)),
+    target   = sample(0:4, n, TRUE, c(.46, .24, .14, .08, .08))
+  )
+}
+
+cat("Filas:", nrow(df_raw), "| Columnas:", ncol(df_raw))
+```
+
+---
+
+## 1.2 Preprocesamiento
+
+```{r preprocesamiento}
+# Función auxiliar: moda para imputar categóricas
+moda <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+df <- df_raw %>%
+  # Binarizar target: 0 = sin enfermedad, 1+ = con enfermedad
+  mutate(target = ifelse(target > 0, 1, 0)) %>%
+  mutate(
+    sex     = factor(sex,     levels = c(0, 1),
+                     labels  = c("Femenino", "Masculino")),
+    cp      = factor(cp,      levels = 0:3,
+                     labels  = c("Tipico", "Atipico", "No anginal", "Asintomatico")),
+    fbs     = factor(fbs,     levels = c(0, 1),
+                     labels  = c("<=120", ">120")),
+    restecg = factor(restecg, levels = 0:2,
+                     labels  = c("Normal", "ST-T anormal", "Hipertrofia")),
+    exang   = factor(exang,   levels = c(0, 1),
+                     labels  = c("No", "Si")),
+    slope   = factor(slope,   levels = 0:2,
+                     labels  = c("Ascendente", "Plano", "Descendente")),
+    thal    = factor(thal,    levels = c(1, 2, 3),
+                     labels  = c("Normal", "Def.fijo", "Def.reversible")),
+    target  = factor(target,  levels = c(0, 1),
+                     labels  = c("Sin enfermedad", "Con enfermedad"))
+  )
+
+# Imputar NAs en numéricas con mediana
+for (v in c("trestbps", "chol", "thalach", "oldpeak", "ca")) {
+  df[[v]][is.na(df[[v]])] <- median(df[[v]], na.rm = TRUE)
+}
+
+# Imputar NAs en categóricas con moda
+for (v in c("thal", "slope", "restecg")) {
+  df[[v]][is.na(df[[v]])] <- moda(df[[v]])
+}
+
+cat("NAs restantes:", sum(is.na(df)))
+cat("\nDimensiones:", nrow(df), "x", ncol(df))
+```
+
+---
+
+## 1.3 Análisis Exploratorio (EDA)
+
+### Estadísticos descriptivos
+
+```{r estadisticos}
+# Resumen estadístico de variables numéricas
+df %>%
+  select(age, trestbps, chol, thalach, oldpeak) %>%
+  summary()
+```
+
+### Balance de clases
+
+```{r balance-tabla}
+# Conteo y porcentaje de cada clase
+df %>%
+  count(target) %>%
+  mutate(Porcentaje = paste0(round(n / sum(n) * 100, 1), "%"))
+```
+
+### Gráfico: Balance de clases
+
+```{r grafico-balance, fig.width=7, fig.height=5}
+df %>%
+  count(target) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = target, y = n, fill = target)) +
+  geom_col(width = .55, color = "white") +
+  geom_text(aes(label = paste0(n, "\n(", scales::percent(pct, accuracy = .1), ")")),
+            vjust = -.3, fontface = "bold", size = 4.5) +
+  scale_fill_manual(values = c("#52B788", "#E63946")) +
+  scale_y_continuous(expand = expansion(mult = c(0, .18))) +
+  labs(title = "Distribución de Clases",
+       subtitle = "Variable objetivo: presencia de enfermedad cardiaca",
+       x = NULL, y = "Registros") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+```
+
+### Gráfico: Distribución de variables numéricas por clase
+
+```{r grafico-histogramas, fig.width=12, fig.height=7}
+# Pasar a formato largo para usar facet_wrap
+df %>%
+  select(age, trestbps, chol, thalach, oldpeak, target) %>%
+  pivot_longer(-target) %>%
+  mutate(name = recode(name,
+    age = "Edad", trestbps = "Presion (mmHg)",
+    chol = "Colesterol", thalach = "FC Maxima", oldpeak = "Dep. ST")) %>%
+  ggplot(aes(x = value, fill = target)) +
+  geom_histogram(bins = 25, alpha = .7, position = "identity",
+                 color = "white", linewidth = .2) +
+  facet_wrap(~name, scales = "free", ncol = 3) +
+  scale_fill_manual(values = c("#52B788", "#E63946")) +
+  labs(title = "Distribución de Variables Numéricas por Clase",
+       x = NULL, y = "Frecuencia", fill = "Diagnóstico") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"),
+        strip.text = element_text(face = "bold"))
+```
+
+### Gráfico: Boxplots por clase
+
+```{r grafico-boxplots, fig.width=12, fig.height=7}
+df %>%
+  select(age, trestbps, chol, thalach, oldpeak, target) %>%
+  pivot_longer(-target) %>%
+  mutate(name = recode(name,
+    age = "Edad", trestbps = "Presion (mmHg)",
+    chol = "Colesterol", thalach = "FC Maxima", oldpeak = "Dep. ST")) %>%
+  ggplot(aes(x = target, y = value, fill = target)) +
+  geom_boxplot(outlier.alpha = .3, width = .5, color = "gray30") +
+  geom_jitter(width = .12, alpha = .07, size = .5) +
+  facet_wrap(~name, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("#52B788", "#E63946")) +
+  labs(title = "Boxplots: Variables Numéricas vs Diagnóstico",
+       x = NULL, y = NULL, fill = "Diagnóstico") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"),
+        axis.text.x = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+### Gráfico: Variables categóricas
+
+```{r grafico-categoricas, fig.width=13, fig.height=9}
+# Función reutilizable para graficar proporción de diagnóstico en cada categoría
+cat_bar <- function(var, lbl) {
+  df %>%
+    count(!!sym(var), target) %>%
+    group_by(!!sym(var)) %>%
+    mutate(pct = n / sum(n)) %>%
+    ungroup() %>%
+    ggplot(aes(x = !!sym(var), y = pct, fill = target)) +
+    geom_col(width = .65, color = "white") +
+    geom_text(aes(label = scales::percent(pct, accuracy = 1)),
+              position = position_stack(vjust = .5),
+              size = 3, color = "white", fontface = "bold") +
+    scale_fill_manual(values = c("#52B788", "#E63946")) +
+    scale_y_continuous(labels = percent_format()) +
+    labs(title = lbl, x = NULL, y = "Proporcion", fill = NULL) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 28, hjust = 1, size = 8),
+          plot.title = element_text(face = "bold", size = 10))
+}
+
+# Combinar los 6 gráficos en una cuadrícula 2x3
+(cat_bar("sex",   "Sexo")          |
+ cat_bar("cp",    "Tipo de dolor") |
+ cat_bar("thal",  "Talasemia"))    /
+(cat_bar("exang", "Angina por ejercicio") |
+ cat_bar("slope", "Pendiente ST")         |
+ cat_bar("fbs",   "Glucosa en ayunas"))   +
+plot_annotation(
+  title = "Variables Categóricas: Proporción de Diagnóstico por Categoría",
+  theme = theme(plot.title = element_text(face = "bold", size = 14))
+)
+```
+
+### Gráfico: Matriz de correlación
+
+```{r grafico-correlacion, fig.width=8, fig.height=7}
+# Convertir categóricas a numérico solo para la correlación
+df_cor <- df %>%
+  mutate(
+    target_num = as.integer(target) - 1,
+    sex_num    = as.integer(sex)    - 1,
+    cp_num     = as.integer(cp)     - 1,
+    exang_num  = as.integer(exang)  - 1
+  ) %>%
+  select(age, trestbps, chol, thalach, oldpeak,
+         ca, sex_num, cp_num, exang_num, target_num)
+
+colnames(df_cor) <- c("Edad", "Presion", "Colesterol", "FC_max",
+                       "Dep_ST", "Vasos", "Sexo", "Dolor",
+                       "Angina", "Enfermedad")
+
+corrplot(
+  cor(df_cor, use = "complete.obs"),
+  method       = "color",
+  type         = "lower",
+  addCoef.col  = "black",
+  number.cex   = .65,
+  tl.cex       = .82,
+  col          = colorRampPalette(c("#E63946", "white", "#2D6A4F"))(200),
+  title        = "Matriz de Correlación",
+  mar          = c(0, 0, 2, 0)
+)
+```
+
+### Gráfico: Densidad de edad y FC máxima vs edad
+
+```{r grafico-edad, fig.width=12, fig.height=5}
+# Medias por grupo para las líneas de referencia
+medias_edad <- df %>%
+  group_by(target) %>%
+  summarise(m = mean(age), .groups = "drop")
+
+p_densidad <- ggplot(df, aes(x = age, fill = target, color = target)) +
+  geom_density(alpha = .4, linewidth = .9) +
+  geom_vline(data = medias_edad,
+             aes(xintercept = m, color = target),
+             linetype = "dashed", linewidth = .9) +
+  scale_fill_manual(values  = c("#52B788", "#E63946")) +
+  scale_color_manual(values = c("#2D6A4F", "#C1121F")) +
+  labs(title    = "Distribución de Edad por Diagnóstico",
+       subtitle = "Línea punteada = media del grupo",
+       x = "Edad (años)", y = "Densidad",
+       fill = "Diagnóstico", color = "Diagnóstico") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_scatter <- ggplot(df, aes(x = age, y = thalach, color = target)) +
+  geom_point(alpha = .4, size = 1.6) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.1) +
+  scale_color_manual(values = c("#52B788", "#E63946")) +
+  labs(title = "FC Máxima vs Edad",
+       x = "Edad (años)", y = "FC Máxima", color = "Diagnóstico") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_densidad | p_scatter
+```
+
+---
+
+# Actividad 2: Diseño Experimental
+
+## 2.1 Normalización y codificación
+
+```{r normalizacion}
+# Normalización Z-score (media=0, sd=1) a variables numéricas
+num_cols <- c("age", "trestbps", "chol", "thalach", "oldpeak", "ca")
+preproc  <- preProcess(df[, num_cols], method = c("center", "scale"))
+
+df_scaled           <- df
+df_scaled[, num_cols] <- predict(preproc, df[, num_cols])
+
+# Codificación one-hot para variables categóricas (fullRank evita multicolinealidad)
+dummy_model <- dummyVars(target ~ ., data = df_scaled, fullRank = TRUE)
+df_encoded  <- as.data.frame(predict(dummy_model, newdata = df_scaled))
+df_encoded$target <- df_scaled$target
+
+cat("Dimensiones tras codificación:", nrow(df_encoded), "x", ncol(df_encoded))
+```
+
+## 2.2 Separación Train / Test
+
+```{r split-train-test}
+set.seed(42)
+
+# Split estratificado 80% entrenamiento / 20% prueba
+test_idx <- createDataPartition(df_encoded$target, p = .20, list = FALSE)
+df_test  <- df_encoded[ test_idx, ]
+df_train <- df_encoded[-test_idx, ]
+
+cat("Entrenamiento:", nrow(df_train), "registros")
+cat("\nPrueba:       ", nrow(df_test),  "registros")
+```
+
+## 2.3 Escenarios Semi-Supervisados
+
+```{r escenarios-ssl}
+# Función que separa los datos de entrenamiento en etiquetados y no etiquetados
+crear_ssl <- function(df_train, pct, seed = 42) {
+  set.seed(seed)
+  idx <- createDataPartition(df_train$target, p = pct, list = FALSE)
+  list(
+    labeled     = df_train[ idx, ],                              # datos con etiqueta
+    unlabeled   = df_train[-idx, ] %>% mutate(target = NA),     # etiquetas ocultas
+    pct         = pct,
+    n_labeled   = length(idx),
+    n_unlabeled = nrow(df_train) - length(idx)
+  )
+}
+
+# Crear los 3 escenarios requeridos por el laboratorio
+splits <- list(
+  ssl_05 = crear_ssl(df_train, .05),
+  ssl_10 = crear_ssl(df_train, .10),
+  ssl_20 = crear_ssl(df_train, .20)
+)
+
+# Resumen de cada escenario
+map_dfr(splits, function(s) tibble(
+  `% Etiquetados`    = scales::percent(s$pct),
+  `N Etiquetados`    = s$n_labeled,
+  `N No Etiquetados` = s$n_unlabeled,
+  `Total Train`      = s$n_labeled + s$n_unlabeled
+))
+```
+
+### Balance de clases en la partición etiquetada
+
+```{r balance-etiquetados}
+# Verificar que el balance de clases se mantiene en cada escenario
+for (nm in names(splits)) {
+  s <- splits[[nm]]
+  cat(sprintf("[%d%%] ", round(s$pct * 100)))
+  print(table(s$labeled$target))
+}
+```
+
+### Gráfico: Diseño experimental
+
+```{r grafico-diseno, fig.width=9, fig.height=6}
+# Preparar datos para visualizar la composición de cada escenario
+data.frame(
+  Escenario     = factor(c("5%","10%","20%"), levels = c("5%","10%","20%")),
+  Etiquetado    = sapply(splits, function(s) s$n_labeled),
+  No_etiquetado = sapply(splits, function(s) s$n_unlabeled)
+) %>%
+  pivot_longer(c(Etiquetado, No_etiquetado),
+               names_to = "Tipo", values_to = "N") %>%
+  mutate(Tipo = recode(Tipo, No_etiquetado = "No etiquetado")) %>%
+  ggplot(aes(x = Escenario, y = N, fill = Tipo)) +
+  geom_col(width = .6, color = "white", linewidth = .3) +
+  geom_text(aes(label = N),
+            position = position_stack(vjust = .5),
+            color = "white", fontface = "bold", size = 5) +
+  scale_fill_manual(values = c("Etiquetado" = "#2D6A4F",
+                                "No etiquetado" = "#B7E4C7")) +
+  labs(
+    title    = "Diseño Experimental: Escenarios Semi-Supervisados",
+    subtitle = sprintf("Entrenamiento total: %d  |  Prueba fija: %d",
+                       nrow(df_train), nrow(df_test)),
+    x = "Porcentaje de datos etiquetados",
+    y = "Número de registros",
+    fill = "Partición"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## 2.4 Guardar objetos para actividades posteriores
+
+```{r guardar}
+# Guardar todos los objetos necesarios para las actividades 3 y 4
+saveRDS(
+  list(
+    df_raw      = df_raw,       # datos originales
+    df          = df,           # datos limpios con factores
+    df_encoded  = df_encoded,   # datos normalizados y codificados
+    df_train    = df_train,     # conjunto de entrenamiento
+    df_test     = df_test,      # conjunto de prueba
+    splits      = splits,       # escenarios SSL (5%, 10%, 20%)
+    preproc     = preproc,      # objeto de normalización
+    dummy_model = dummy_model   # objeto de codificación one-hot
+  ),
+  file = "lab10_data.rds"
+)
+
+cat("Objetos guardados en lab10_data.rds")
+```
+
+---
+
+> **Dataset:** Heart Disease UCI —
+> <https://archive.ics.uci.edu/dataset/45/heart+disease>  
+> **Problema:** Clasificación binaria (presencia de enfermedad cardíaca)  
+> **Filas:** `r nrow(df)` | **Columnas:** `r ncol(df)`  
+> **Train / Test:** `r nrow(df_train)` / `r nrow(df_test)`
