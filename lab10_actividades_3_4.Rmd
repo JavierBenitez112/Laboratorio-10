@@ -1,6 +1,6 @@
 ---
 title: "Laboratorio 10: Aprendizaje Semi-Supervisado"
-subtitle: "Heart Disease UCI — EDA, Diseño Experimental, Experimentación y Visualización"
+subtitle: "Actividades 3 y 4 — Experimentación y Visualización"
 author: "Grupo de Laboratorio"
 date: "`r Sys.Date()`"
 output:
@@ -26,7 +26,6 @@ library(dplyr)
 library(tidyr)
 library(purrr)
 library(scales)
-library(corrplot)
 library(patchwork)
 library(caret)
 library(randomForest)   # baseline supervisado
@@ -39,384 +38,22 @@ theme_set(theme_minimal(base_size = 13))
 
 ---
 
-# Actividad 1: Selección y Análisis del Dataset
+# Carga de datos
 
-## 1.1 Carga del Dataset
+Cargamos los objetos generados en las actividades 1 y 2.
 
-El dataset utilizado es **Heart Disease UCI**, disponible en:
-<https://archive.ics.uci.edu/dataset/45/heart+disease>
+```{r cargar-datos}
+# El .rds contiene df_train, df_test, splits (5%, 10%, 20%), preproc y dummy_model
+datos    <- readRDS("lab10_data.rds")
+df_train <- datos$df_train
+df_test  <- datos$df_test
+splits   <- datos$splits
 
-Combina datos de 4 hospitales: Cleveland, Hungarian, Switzerland y Long Beach VA.
-Cumple con los requisitos: **14 columnas** y **1,190 filas**.
+X_test <- df_test %>% select(-target)
+y_test <- df_test$target
 
-```{r carga}
-col_names <- c("age", "sex", "cp", "trestbps", "chol", "fbs",
-               "restecg", "thalach", "exang", "oldpeak",
-               "slope", "ca", "thal", "target")
-
-cargar_heart <- function() {
-  urls <- c(
-    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.cleveland.data",
-    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.hungarian.data",
-    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.switzerland.data",
-    "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.va.data"
-  )
-  dfs <- lapply(urls, function(u) {
-    tryCatch(
-      read.csv(u, header = FALSE, col.names = col_names,
-               na.strings = "?", stringsAsFactors = FALSE),
-      error = function(e) NULL
-    )
-  })
-  bind_rows(Filter(Negate(is.null), dfs))
-}
-
-df_raw <- cargar_heart()
-
-# Si no hay conexión, se generan datos sintéticos con las mismas propiedades estadísticas
-if (nrow(df_raw) < 100) {
-  set.seed(42)
-  n <- 1190
-  df_raw <- data.frame(
-    age      = round(rnorm(n, 54, 9)),
-    sex      = sample(0:1, n, TRUE, c(.32, .68)),
-    cp       = sample(0:3, n, TRUE, c(.47, .28, .17, .08)),
-    trestbps = round(rnorm(n, 131, 18)),
-    chol     = round(rnorm(n, 246, 52)),
-    fbs      = sample(0:1, n, TRUE, c(.85, .15)),
-    restecg  = sample(0:2, n, TRUE, c(.50, .02, .48)),
-    thalach  = round(rnorm(n, 149, 23)),
-    exang    = sample(0:1, n, TRUE, c(.67, .33)),
-    oldpeak  = round(pmax(0, rnorm(n, 1.05, 1.15)), 1),
-    slope    = sample(0:2, n, TRUE, c(.21, .50, .29)),
-    ca       = sample(0:3, n, TRUE, c(.58, .22, .13, .07)),
-    thal     = sample(c(1, 2, 3), n, TRUE, c(.06, .55, .39)),
-    target   = sample(0:4, n, TRUE, c(.46, .24, .14, .08, .08))
-  )
-}
-
-cat("Filas:", nrow(df_raw), "| Columnas:", ncol(df_raw))
-```
-
----
-
-## 1.2 Preprocesamiento
-
-```{r preprocesamiento}
-moda <- function(x) {
-  ux <- na.omit(unique(x))
-  ux[which.max(tabulate(match(x, ux)))]
-}
-
-df <- df_raw %>%
-  mutate(target = ifelse(target > 0, 1, 0)) %>%
-  mutate(
-    sex     = factor(sex,     levels = c(0, 1),
-                     labels  = c("Femenino", "Masculino")),
-    cp      = factor(cp,      levels = 0:3,
-                     labels  = c("Tipico", "Atipico", "No anginal", "Asintomatico")),
-    fbs     = factor(fbs,     levels = c(0, 1),
-                     labels  = c("<=120", ">120")),
-    restecg = factor(restecg, levels = 0:2,
-                     labels  = c("Normal", "ST-T anormal", "Hipertrofia")),
-    exang   = factor(exang,   levels = c(0, 1),
-                     labels  = c("No", "Si")),
-    slope   = factor(slope,   levels = 0:2,
-                     labels  = c("Ascendente", "Plano", "Descendente")),
-    thal    = factor(thal,    levels = c(1, 2, 3),
-                     labels  = c("Normal", "Def.fijo", "Def.reversible")),
-    target  = factor(target,  levels = c(0, 1),
-                     labels  = c("Sin enfermedad", "Con enfermedad"))
-  )
-
-for (v in c("trestbps", "chol", "thalach", "oldpeak", "ca")) {
-  df[[v]][is.na(df[[v]])] <- median(df[[v]], na.rm = TRUE)
-}
-
-for (v in c("thal", "slope", "restecg")) {
-  df[[v]][is.na(df[[v]])] <- moda(df[[v]])
-}
-
-cat("NAs restantes:", sum(is.na(df)))
-cat("\nDimensiones:", nrow(df), "x", ncol(df))
-```
-
----
-
-## 1.3 Análisis Exploratorio (EDA)
-
-### Estadísticos descriptivos
-
-```{r estadisticos}
-df %>%
-  select(age, trestbps, chol, thalach, oldpeak) %>%
-  summary()
-```
-
-### Balance de clases
-
-```{r balance-tabla}
-df %>%
-  count(target) %>%
-  mutate(Porcentaje = paste0(round(n / sum(n) * 100, 1), "%"))
-```
-
-### Gráfico: Balance de clases
-
-```{r grafico-balance, fig.width=7, fig.height=5}
-df %>%
-  count(target) %>%
-  mutate(pct = n / sum(n)) %>%
-  ggplot(aes(x = target, y = n, fill = target)) +
-  geom_col(width = .55, color = "white") +
-  geom_text(aes(label = paste0(n, "\n(", scales::percent(pct, accuracy = .1), ")")),
-            vjust = -.3, fontface = "bold", size = 4.5) +
-  scale_fill_manual(values = c("#52B788", "#E63946")) +
-  scale_y_continuous(expand = expansion(mult = c(0, .18))) +
-  labs(title = "Distribución de Clases",
-       subtitle = "Variable objetivo: presencia de enfermedad cardiaca",
-       x = NULL, y = "Registros") +
-  theme(legend.position = "none",
-        plot.title = element_text(face = "bold"))
-```
-
-### Gráfico: Distribución de variables numéricas por clase
-
-```{r grafico-histogramas, fig.width=12, fig.height=7}
-df %>%
-  select(age, trestbps, chol, thalach, oldpeak, target) %>%
-  pivot_longer(-target) %>%
-  mutate(name = recode(name,
-    age = "Edad", trestbps = "Presion (mmHg)",
-    chol = "Colesterol", thalach = "FC Maxima", oldpeak = "Dep. ST")) %>%
-  ggplot(aes(x = value, fill = target)) +
-  geom_histogram(bins = 25, alpha = .7, position = "identity",
-                 color = "white", linewidth = .2) +
-  facet_wrap(~name, scales = "free", ncol = 3) +
-  scale_fill_manual(values = c("#52B788", "#E63946")) +
-  labs(title = "Distribución de Variables Numéricas por Clase",
-       x = NULL, y = "Frecuencia", fill = "Diagnóstico") +
-  theme(legend.position = "bottom",
-        plot.title = element_text(face = "bold"),
-        strip.text = element_text(face = "bold"))
-```
-
-### Gráfico: Boxplots por clase
-
-```{r grafico-boxplots, fig.width=12, fig.height=7}
-df %>%
-  select(age, trestbps, chol, thalach, oldpeak, target) %>%
-  pivot_longer(-target) %>%
-  mutate(name = recode(name,
-    age = "Edad", trestbps = "Presion (mmHg)",
-    chol = "Colesterol", thalach = "FC Maxima", oldpeak = "Dep. ST")) %>%
-  ggplot(aes(x = target, y = value, fill = target)) +
-  geom_boxplot(outlier.alpha = .3, width = .5, color = "gray30") +
-  geom_jitter(width = .12, alpha = .07, size = .5) +
-  facet_wrap(~name, scales = "free_y", ncol = 3) +
-  scale_fill_manual(values = c("#52B788", "#E63946")) +
-  labs(title = "Boxplots: Variables Numéricas vs Diagnóstico",
-       x = NULL, y = NULL, fill = "Diagnóstico") +
-  theme(legend.position = "bottom",
-        plot.title = element_text(face = "bold"),
-        axis.text.x = element_blank(),
-        strip.text = element_text(face = "bold"))
-```
-
-### Gráfico: Variables categóricas
-
-```{r grafico-categoricas, fig.width=13, fig.height=9}
-cat_bar <- function(var, lbl) {
-  df %>%
-    count(!!sym(var), target) %>%
-    group_by(!!sym(var)) %>%
-    mutate(pct = n / sum(n)) %>%
-    ungroup() %>%
-    ggplot(aes(x = !!sym(var), y = pct, fill = target)) +
-    geom_col(width = .65, color = "white") +
-    geom_text(aes(label = scales::percent(pct, accuracy = 1)),
-              position = position_stack(vjust = .5),
-              size = 3, color = "white", fontface = "bold") +
-    scale_fill_manual(values = c("#52B788", "#E63946")) +
-    scale_y_continuous(labels = percent_format()) +
-    labs(title = lbl, x = NULL, y = "Proporcion", fill = NULL) +
-    theme(legend.position = "none",
-          axis.text.x = element_text(angle = 28, hjust = 1, size = 8),
-          plot.title = element_text(face = "bold", size = 10))
-}
-
-(cat_bar("sex",   "Sexo")          |
- cat_bar("cp",    "Tipo de dolor") |
- cat_bar("thal",  "Talasemia"))    /
-(cat_bar("exang", "Angina por ejercicio") |
- cat_bar("slope", "Pendiente ST")         |
- cat_bar("fbs",   "Glucosa en ayunas"))   +
-plot_annotation(
-  title = "Variables Categóricas: Proporción de Diagnóstico por Categoría",
-  theme = theme(plot.title = element_text(face = "bold", size = 14))
-)
-```
-
-### Gráfico: Matriz de correlación
-
-```{r grafico-correlacion, fig.width=8, fig.height=7}
-df_cor <- df %>%
-  mutate(
-    target_num = as.integer(target) - 1,
-    sex_num    = as.integer(sex)    - 1,
-    cp_num     = as.integer(cp)     - 1,
-    exang_num  = as.integer(exang)  - 1
-  ) %>%
-  select(age, trestbps, chol, thalach, oldpeak,
-         ca, sex_num, cp_num, exang_num, target_num)
-
-colnames(df_cor) <- c("Edad", "Presion", "Colesterol", "FC_max",
-                       "Dep_ST", "Vasos", "Sexo", "Dolor",
-                       "Angina", "Enfermedad")
-
-corrplot(
-  cor(df_cor, use = "complete.obs"),
-  method       = "color",
-  type         = "lower",
-  addCoef.col  = "black",
-  number.cex   = .65,
-  tl.cex       = .82,
-  col          = colorRampPalette(c("#E63946", "white", "#2D6A4F"))(200),
-  title        = "Matriz de Correlación",
-  mar          = c(0, 0, 2, 0)
-)
-```
-
-### Gráfico: Densidad de edad y FC máxima vs edad
-
-```{r grafico-edad, fig.width=12, fig.height=5}
-medias_edad <- df %>%
-  group_by(target) %>%
-  summarise(m = mean(age), .groups = "drop")
-
-p_densidad <- ggplot(df, aes(x = age, fill = target, color = target)) +
-  geom_density(alpha = .4, linewidth = .9) +
-  geom_vline(data = medias_edad,
-             aes(xintercept = m, color = target),
-             linetype = "dashed", linewidth = .9) +
-  scale_fill_manual(values  = c("#52B788", "#E63946")) +
-  scale_color_manual(values = c("#2D6A4F", "#C1121F")) +
-  labs(title    = "Distribución de Edad por Diagnóstico",
-       subtitle = "Línea punteada = media del grupo",
-       x = "Edad (años)", y = "Densidad",
-       fill = "Diagnóstico", color = "Diagnóstico") +
-  theme(plot.title = element_text(face = "bold"))
-
-p_scatter <- ggplot(df, aes(x = age, y = thalach, color = target)) +
-  geom_point(alpha = .4, size = 1.6) +
-  geom_smooth(method = "lm", se = TRUE, linewidth = 1.1) +
-  scale_color_manual(values = c("#52B788", "#E63946")) +
-  labs(title = "FC Máxima vs Edad",
-       x = "Edad (años)", y = "FC Máxima", color = "Diagnóstico") +
-  theme(plot.title = element_text(face = "bold"))
-
-p_densidad | p_scatter
-```
-
----
-
-# Actividad 2: Diseño Experimental
-
-## 2.1 Normalización y codificación
-
-```{r normalizacion}
-num_cols <- c("age", "trestbps", "chol", "thalach", "oldpeak", "ca")
-preproc  <- preProcess(df[, num_cols], method = c("center", "scale"))
-
-df_scaled             <- df
-df_scaled[, num_cols] <- predict(preproc, df[, num_cols])
-
-dummy_model <- dummyVars(target ~ ., data = df_scaled, fullRank = TRUE)
-df_encoded  <- as.data.frame(predict(dummy_model, newdata = df_scaled))
-df_encoded$target <- df_scaled$target
-
-cat("Dimensiones tras codificación:", nrow(df_encoded), "x", ncol(df_encoded))
-```
-
-## 2.2 Separación Train / Test
-
-```{r split-train-test}
-set.seed(42)
-
-test_idx <- createDataPartition(df_encoded$target, p = .20, list = FALSE)
-df_test  <- df_encoded[ test_idx, ]
-df_train <- df_encoded[-test_idx, ]
-
-cat("Entrenamiento:", nrow(df_train), "registros")
-cat("\nPrueba:       ", nrow(df_test),  "registros")
-```
-
-## 2.3 Escenarios Semi-Supervisados
-
-```{r escenarios-ssl}
-crear_ssl <- function(df_train, pct, seed = 42) {
-  set.seed(seed)
-  idx <- createDataPartition(df_train$target, p = pct, list = FALSE)
-  list(
-    labeled     = df_train[ idx, ],
-    unlabeled   = df_train[-idx, ] %>% mutate(target = NA),
-    pct         = pct,
-    n_labeled   = length(idx),
-    n_unlabeled = nrow(df_train) - length(idx)
-  )
-}
-
-splits <- list(
-  ssl_05 = crear_ssl(df_train, .05),
-  ssl_10 = crear_ssl(df_train, .10),
-  ssl_20 = crear_ssl(df_train, .20)
-)
-
-map_dfr(splits, function(s) tibble(
-  `% Etiquetados`    = scales::percent(s$pct),
-  `N Etiquetados`    = s$n_labeled,
-  `N No Etiquetados` = s$n_unlabeled,
-  `Total Train`      = s$n_labeled + s$n_unlabeled
-))
-```
-
-### Balance de clases en la partición etiquetada
-
-```{r balance-etiquetados}
-for (nm in names(splits)) {
-  s <- splits[[nm]]
-  cat(sprintf("[%d%%] ", round(s$pct * 100)))
-  print(table(s$labeled$target))
-}
-```
-
-### Gráfico: Diseño experimental
-
-```{r grafico-diseno, fig.width=9, fig.height=6}
-data.frame(
-  Escenario     = factor(c("5%","10%","20%"), levels = c("5%","10%","20%")),
-  Etiquetado    = sapply(splits, function(s) s$n_labeled),
-  No_etiquetado = sapply(splits, function(s) s$n_unlabeled)
-) %>%
-  pivot_longer(c(Etiquetado, No_etiquetado),
-               names_to = "Tipo", values_to = "N") %>%
-  mutate(Tipo = recode(Tipo, No_etiquetado = "No etiquetado")) %>%
-  ggplot(aes(x = Escenario, y = N, fill = Tipo)) +
-  geom_col(width = .6, color = "white", linewidth = .3) +
-  geom_text(aes(label = N),
-            position = position_stack(vjust = .5),
-            color = "white", fontface = "bold", size = 5) +
-  scale_fill_manual(values = c("Etiquetado" = "#2D6A4F",
-                                "No etiquetado" = "#B7E4C7")) +
-  labs(
-    title    = "Diseño Experimental: Escenarios Semi-Supervisados",
-    subtitle = sprintf("Entrenamiento total: %d  |  Prueba fija: %d",
-                       nrow(df_train), nrow(df_test)),
-    x = "Porcentaje de datos etiquetados",
-    y = "Número de registros",
-    fill = "Partición"
-  ) +
-  theme(plot.title = element_text(face = "bold"))
+cat("Train:", nrow(df_train), "| Test:", nrow(df_test))
+cat("\nClases:", paste(levels(y_test), collapse = " / "))
 ```
 
 ---
@@ -435,11 +72,6 @@ Se evalúan **3 escenarios** (5%, 10%, 20% etiquetados) variando los
 hiperparámetros de cada modelo. Se selecciona la mejor configuración
 por F1-Score sobre el conjunto de prueba fijo.
 
-```{r preparar-test}
-X_test <- df_test %>% select(-target)
-y_test <- df_test$target
-```
-
 ---
 
 ## 3.1 Baseline: Random Forest supervisado
@@ -457,6 +89,7 @@ Sirve como referencia para medir la ganancia de los modelos semi-supervisados.
 | `mtry` | Variables candidatas por split | `sqrt(p)`, `p/3` |
 
 ```{r funcion-rf}
+# Entrena RF y retorna métricas sobre el conjunto de prueba
 entrenar_rf <- function(X_lab, y_lab, ntree = 200, mtry = NULL) {
   if (is.null(mtry)) mtry <- floor(sqrt(ncol(X_lab)))
 
@@ -546,17 +179,21 @@ self_training_svm <- function(X_lab, y_lab, X_unlab,
   repeat {
     iter <- iter + 1
 
+    # Entrenar SVM con los datos etiquetados actuales
     modelo <- svm(x = X_lab, y = y_lab, kernel = "radial",
                   cost = cost, probability = TRUE)
 
+    # Salir si no quedan no etiquetados o se alcanzó el límite
     if (nrow(X_pool) == 0 || iter >= max_iter) break
 
+    # Predecir probabilidades sobre el pool
     prob_pool <- attr(predict(modelo, X_pool, probability = TRUE), "probabilities")
     confianza <- apply(prob_pool, 1, max)
     seguros   <- which(confianza >= threshold)
 
     if (length(seguros) == 0) break
 
+    # Asignar pseudo-etiquetas y mover al conjunto etiquetado
     pseudo_y <- factor(
       colnames(prob_pool)[apply(prob_pool[seguros, , drop = FALSE], 1, which.max)],
       levels = levels(y_lab)
@@ -566,6 +203,7 @@ self_training_svm <- function(X_lab, y_lab, X_unlab,
     X_pool <- X_pool[-seguros, ]
   }
 
+  # Evaluación final sobre conjunto de prueba
   pred      <- predict(modelo, X_test)
   pred_prob <- attr(predict(modelo, X_test, probability = TRUE),
                     "probabilities")[, "Con enfermedad"]
@@ -647,6 +285,7 @@ tsvm <- function(X_lab, y_lab, X_unlab,
 
   n_lab <- nrow(X_lab)
 
+  # Paso 1: inicializar pseudo-etiquetas con SVM supervisado
   init_svm <- svm(x = X_lab, y = y_lab, kernel = "radial",
                   cost = C_labeled, probability = TRUE)
   prob_ini <- attr(predict(init_svm, X_unlab, probability = TRUE), "probabilities")
@@ -655,13 +294,16 @@ tsvm <- function(X_lab, y_lab, X_unlab,
     levels = levels(y_lab)
   )
 
+  # Combinar etiquetados y no etiquetados
   X_all <- rbind(X_lab, X_unlab)
   y_all <- c(y_lab, pseudo_y)
 
+  # Paso 2: annealing — aumentar C_unlabeled gradualmente
   for (cu in seq(C_unlabeled / pasos, C_unlabeled, length.out = pasos)) {
     modelo <- svm(x = X_all, y = y_all, kernel = "radial",
                   cost = C_labeled, probability = TRUE)
 
+    # Re-estimar pseudo-etiquetas con el modelo actualizado
     prob_unl <- attr(predict(modelo, X_unlab, probability = TRUE), "probabilities")
     pseudo_y <- factor(
       colnames(prob_unl)[apply(prob_unl, 1, which.max)],
@@ -670,6 +312,7 @@ tsvm <- function(X_lab, y_lab, X_unlab,
     y_all[(n_lab + 1):length(y_all)] <- pseudo_y
   }
 
+  # Evaluación final
   pred      <- predict(modelo, X_test)
   pred_prob <- attr(predict(modelo, X_test, probability = TRUE),
                     "probabilities")[, "Con enfermedad"]
@@ -724,6 +367,7 @@ ts_mejor %>% select(Escenario, C_labeled, C_unlabeled, F1, AUC)
 ## 3.4 Tabla comparativa global
 
 ```{r tabla-comparativa}
+# Unir los mejores resultados de cada modelo
 comparativa <- bind_rows(
   rf_mejor %>% select(Escenario, Modelo, Accuracy, F1, Recall, Precision, AUC),
   st_mejor %>% select(Escenario, Modelo, Accuracy, F1, Recall, Precision, AUC),
@@ -739,6 +383,7 @@ comparativa
 # Actividad 4: Visualización
 
 ```{r paleta-colores}
+# Paleta consistente para los 3 modelos en todos los gráficos
 COLS <- c(
   "Random Forest (baseline)" = "#457B9D",
   "Self-Training SVM"        = "#2D6A4F",
@@ -867,16 +512,18 @@ X_lab <- s20$labeled   %>% select(-target)
 y_lab <- s20$labeled$target
 X_unl <- s20$unlabeled %>% select(-target)
 
+# Mejores hiperparámetros del escenario 20%
 rh <- rf_mejor %>% filter(Escenario == "20%")
 sh <- st_mejor %>% filter(Escenario == "20%")
 th <- ts_mejor %>% filter(Escenario == "20%")
 
-# Random Forest
-res_rf  <- entrenar_rf(X_lab, y_lab, ntree = rh$ntree, mtry = rh$mtry)
-pred_rf <- res_rf$pred
-prob_rf <- res_rf$pred_prob
+# ── Random Forest ─────────────────────────────────────────────────────────
+res_rf    <- entrenar_rf(X_lab, y_lab, ntree = rh$ntree, mtry = rh$mtry)
+pred_rf   <- res_rf$pred
+prob_rf   <- res_rf$pred_prob
 
-# Self-Training SVM
+# ── Self-Training SVM ─────────────────────────────────────────────────────
+# Replicar el loop iterativo para recuperar el modelo entrenado
 Xl2 <- X_lab; yl2 <- y_lab; Xp <- X_unl
 for (i in 1:15) {
   m_st <- svm(x = Xl2, y = yl2, kernel = "radial",
@@ -894,8 +541,8 @@ pred_st <- predict(m_st, X_test)
 prob_st <- attr(predict(m_st, X_test, probability = TRUE),
                 "probabilities")[, "Con enfermedad"]
 
-# TSVM
-nl  <- nrow(X_lab)
+# ── TSVM ──────────────────────────────────────────────────────────────────
+nl <- nrow(X_lab)
 ini <- svm(x = X_lab, y = y_lab, kernel = "radial",
            cost = th$C_labeled, probability = TRUE)
 pi  <- attr(predict(ini, X_unl, probability = TRUE), "probabilities")
@@ -914,6 +561,7 @@ prob_tsvm <- attr(predict(m_ts, X_test, probability = TRUE),
 ```
 
 ```{r viz-confusion, fig.width=13, fig.height=4.5}
+# Construir dataframe de matrices de confusión para ggplot
 conf_df <- function(pred, y, titulo) {
   as.data.frame(table(Predicho = pred, Real = y)) %>%
     mutate(Titulo = titulo)
@@ -948,6 +596,7 @@ roc_rf   <- roc(y_bin, prob_rf,   quiet = TRUE)
 roc_st   <- roc(y_bin, prob_st,   quiet = TRUE)
 roc_tsvm <- roc(y_bin, prob_tsvm, quiet = TRUE)
 
+# Convertir a dataframe para ggplot
 roc_to_df <- function(roc_obj, nombre) {
   data.frame(
     FPR    = 1 - roc_obj$specificities,
@@ -984,6 +633,7 @@ ggplot(roc_df, aes(x = FPR, y = TPR, color = Modelo)) +
 ## 4.6 Distribución de probabilidades predichas (real vs predicho)
 
 ```{r viz-prob-dist, fig.width=13, fig.height=4.5}
+# Permite visualizar qué tan bien cada modelo separa las dos clases
 prob_df <- bind_rows(
   data.frame(Prob = prob_rf,   Real = y_test,
              Modelo = "Random Forest (baseline)"),
@@ -1014,6 +664,7 @@ ggplot(prob_df, aes(x = Prob, fill = Real)) +
 # Conclusiones
 
 ```{r conclusiones}
+# Mejor modelo por escenario
 mejor_por_escenario <- comparativa %>%
   group_by(Escenario) %>%
   slice_max(F1, n = 1) %>%
@@ -1022,6 +673,7 @@ mejor_por_escenario <- comparativa %>%
 cat("Mejor modelo por escenario:\n")
 print(mejor_por_escenario)
 
+# Ganancia del mejor SSL vs baseline en el escenario más restrictivo (5%)
 base_5 <- comparativa %>%
   filter(Escenario == "5%", grepl("baseline", Modelo)) %>%
   pull(F1)
@@ -1056,11 +708,3 @@ cat(sprintf("Modelo ganador en escenario 5%%: %s\n", mejor_5$Modelo))
 > - La brecha entre SSL y baseline **se reduce con más etiquetas** (20%), lo
 >   que es esperado: a mayor fracción etiquetada, los métodos supervisados son
 >   suficientes para capturar la distribución de clases.
-
----
-
-> **Dataset:** Heart Disease UCI —
-> <https://archive.ics.uci.edu/dataset/45/heart+disease>
-> **Problema:** Clasificación binaria (presencia de enfermedad cardíaca)
-> **Filas:** `r nrow(df)` | **Columnas:** `r ncol(df)`
-> **Train / Test:** `r nrow(df_train)` / `r nrow(df_test)`
